@@ -35,11 +35,10 @@ from pipecatcloud.agent import (
 
 from runner import configure
 from functions import (
-    retrieve_business_info,
     appointment_script,
     tools
 )
-from rag import initialize_rag_query_engine
+from rag import initialize_rag_query_engine, retrieve_business_info
 
 load_dotenv(override=True)
 

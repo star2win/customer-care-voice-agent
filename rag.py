@@ -13,6 +13,8 @@ from pipecat.services.llm_service import FunctionCallParams
 KNOWLEDGE_BASE_DIR = "knowledge_base_docs"  # Directory for your knowledge documents
 RAG_RETRIEVER = None  # Global variable for the retriever
 
+__all__ = ['initialize_rag_query_engine', 'retrieve_business_info', 'RAG_RETRIEVER']
+
 def initialize_rag_query_engine():
     """Initialize the RAG query engine with LlamaIndex."""
     global RAG_RETRIEVER
