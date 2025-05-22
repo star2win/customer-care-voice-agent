@@ -44,69 +44,70 @@ from llama_index.core import Settings, SimpleDirectoryReader, VectorStoreIndex
 from llama_index.core.node_parser import SentenceSplitter
 from llama_index.embeddings.openai import OpenAIEmbedding # Corrected import
 from llama_index.llms.openai import OpenAI as LlamaOpenAI # Corrected import, aliased to avoid conflict
+from llama_index.core.callbacks import CallbackManager, LlamaDebugHandler # Timing handler
 # --- LlamaIndex Imports END ---
 
 load_dotenv(override=True)
 
 # --- LlamaIndex RAG Setup START ---
 KNOWLEDGE_BASE_DIR = "knowledge_base_docs"  # Directory for your knowledge documents
-RAG_QUERY_ENGINE = None # Global variable for the query engine
+RAG_RETRIEVER = None  # Global variable for the retriever
 
 def initialize_rag_query_engine():
-    global RAG_QUERY_ENGINE
-    if RAG_QUERY_ENGINE is None:
-        logger.info("Initializing LlamaIndex RAG query engine...")
+    global RAG_RETRIEVER
+
+    llama_debug = LlamaDebugHandler(print_trace_on_end=True)
+    callback_manager = CallbackManager([llama_debug])
+    Settings.callback_manager = callback_manager  # Apply it globally to LlamaIndex Settings
+
+    if RAG_RETRIEVER is None:
+        logger.info("Initializing LlamaIndex RAG retriever...")
         try:
             # Configure LlamaIndex to use OpenAI models for LLM and Embeddings
-            # It will use OPENAI_API_KEY from environment variables
-            Settings.llm = LlamaOpenAI(model="gpt-3.5-turbo") # Can be gpt-4o too, but 3.5-turbo is faster/cheaper for RAG synthesis
-            Settings.embed_model = OpenAIEmbedding(model="text-embedding-3-small") # Or "text-embedding-ada-002"
+            Settings.llm = LlamaOpenAI(model="gpt-3.5-turbo")
+            Settings.embed_model = OpenAIEmbedding(model="text-embedding-3-small")
             Settings.node_parser = SentenceSplitter(chunk_size=512, chunk_overlap=20)
-            Settings.num_output = 256 # Max tokens for LLM response in RAG
-            Settings.context_window = 3900 # For gpt-3.5-turbo
+            Settings.num_output = 256
+            Settings.context_window = 3900
 
             # Check if knowledge base directory exists
             kb_path = Path(KNOWLEDGE_BASE_DIR)
             if not kb_path.exists() or not any(kb_path.iterdir()):
-                 logger.warning(f"Knowledge base directory '{KNOWLEDGE_BASE_DIR}' is empty or does not exist.")
-                 logger.warning("RAG will not be able to answer questions from the knowledge base.")
-                 # You might want to create an empty index or handle this case differently
-                 # For now, we'll let it proceed, and the retriever will find nothing.
-                 documents = []
+                logger.warning(f"Knowledge base directory '{KNOWLEDGE_BASE_DIR}' is empty or does not exist.")
+                logger.warning("RAG will not be able to answer questions from the knowledge base.")
+                documents = []
             else:
                 reader = SimpleDirectoryReader(KNOWLEDGE_BASE_DIR)
                 documents = reader.load_data()
 
             if not documents:
                 logger.warning("No documents found in the knowledge base. RAG might not be effective.")
-                # Create an empty index if no documents are found to prevent errors later
-                # This is a simplistic way to handle it; a more robust solution might be needed.
-                RAG_QUERY_ENGINE = "empty" # Special placeholder
+                RAG_RETRIEVER = "empty"  # Special placeholder
                 return
 
             index = VectorStoreIndex.from_documents(documents)
-            RAG_QUERY_ENGINE = index.as_query_engine(similarity_top_k=3) # Retrieve top 3 similar nodes
-            logger.info("LlamaIndex RAG query engine initialized successfully.")
+            RAG_RETRIEVER = index.as_retriever(similarity_top_k=2)  # Retrieve top 2 similar nodes for better context
+            logger.info("LlamaIndex RAG retriever initialized successfully.")
         except Exception as e:
-            logger.error(f"Failed to initialize LlamaIndex RAG query engine: {e}")
-            RAG_QUERY_ENGINE = None # Ensure it's None if initialization fails
+            logger.error(f"Failed to initialize LlamaIndex RAG retriever: {e}")
+            RAG_RETRIEVER = None
 
 async def retrieve_business_info(params: FunctionCallParams):
     """
     Retrieves relevant information from the business knowledge base using LlamaIndex
     based on a user's query.
     """
-    if RAG_QUERY_ENGINE is None:
-        logger.error("RAG Query Engine is not initialized.")
+    if RAG_RETRIEVER is None:
+        logger.error("RAG Retriever is not initialized.")
         await params.result_callback({
             "status": "error",
-            "message": "Knowledge base search is currently unavailable (engine not initialized).",
+            "message": "Knowledge base search is currently unavailable (retriever not initialized).",
             "retrieved_snippets": []
         })
         return
     
-    if RAG_QUERY_ENGINE == "empty":
-        logger.warning("RAG Query Engine is empty (no documents loaded).")
+    if RAG_RETRIEVER == "empty":
+        logger.warning("RAG Retriever is empty (no documents loaded).")
         await params.result_callback({
             "status": "info_not_found",
             "message": "No information found in the knowledge base.",
@@ -127,27 +128,18 @@ async def retrieve_business_info(params: FunctionCallParams):
     try:
         # Use aiohttp.loop.run_in_executor for synchronous LlamaIndex call
         loop = asyncio.get_event_loop()
-        # LlamaIndex query is synchronous, so run it in an executor
-        response = await loop.run_in_executor(None, RAG_QUERY_ENGINE.query, query)
+        # LlamaIndex retrieve is synchronous, so run it in an executor
+        retrieved_nodes = await loop.run_in_executor(None, RAG_RETRIEVER.retrieve, query)
         
-        retrieved_text = str(response) # response.response is also common
-        source_nodes_texts = [node.get_content() for node in response.source_nodes]
+        if retrieved_nodes:
+            snippets = [node.get_content() for node in retrieved_nodes]
+            logger.info(f"RAG: Retrieved {len(snippets)} snippets")
+            logger.debug(f"RAG: First snippet preview: {snippets[0][:200]}...")
 
-        logger.info(f"RAG: Retrieved response: {retrieved_text}")
-        logger.debug(f"RAG: Source nodes count: {len(response.source_nodes)}")
-        # for i, node in enumerate(response.source_nodes):
-        #     logger.debug(f"RAG Source Node {i+1} (Score: {node.score:.4f}):\n{node.get_content()[:200]}...")
-
-
-        if retrieved_text and "empty query result" not in retrieved_text.lower() and "i don't know" not in retrieved_text.lower():
-             # LlamaIndex query engine's response IS the synthesized answer.
-             # We will pass this directly as the "snippet" for the main LLM to use.
-             # Or, you could have the main LLM just relay this if it's good enough.
-             # For simplicity, we'll pass it as if it's a retrieved chunk.
             await params.result_callback({
                 "status": "success",
                 "message": "Information retrieved successfully.",
-                "retrieved_snippets": [retrieved_text] # Pass the synthesized answer as a single snippet
+                "retrieved_snippets": snippets
             })
         else:
             await params.result_callback({
@@ -156,7 +148,7 @@ async def retrieve_business_info(params: FunctionCallParams):
                 "retrieved_snippets": []
             })
     except Exception as e:
-        logger.error(f"Error querying LlamaIndex: {e}")
+        logger.error(f"Error retrieving from LlamaIndex: {e}")
         await params.result_callback({
             "status": "error",
             "message": f"An error occurred while searching the knowledge base: {str(e)}",
@@ -165,7 +157,7 @@ async def retrieve_business_info(params: FunctionCallParams):
 
 retrieve_business_info_schema = FunctionSchema(
     name="retrieve_business_info",
-    description="Looks up information about Bavarian Motor Experts (services, hours, location, policies, specific details etc.) from the company's knowledge base. Use this tool when the user asks a question that isn't about scheduling an appointment and requires specific business details.",
+    description="Looks up information about Bavarian Motor Experts (services, hours, location, policies, specific details etc.) from the company's knowledge base. Use this tool when the user asks a question that isn't about scheduling an appointment and requires specific business details. The tool returns raw text snippets from the knowledge base that you should use to formulate your response.",
     properties={
         "query": {
             "type": "string",
@@ -177,7 +169,7 @@ retrieve_business_info_schema = FunctionSchema(
 # --- LlamaIndex RAG Setup END --- 
 
 async def appointment_script(params: FunctionCallParams):
-    await params.llm.push_frame(TTSSpeakFrame("I'll send the appointment request now."))
+#    await params.llm.push_frame(TTSSpeakFrame("I'm waiting to confirm the appointment request."))
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
@@ -187,14 +179,18 @@ async def appointment_script(params: FunctionCallParams):
                     "phone": int(params.arguments.get("phone")),
                     "make": params.arguments.get("make"),
                     "model": params.arguments.get("model"),
-                    "year": params.arguments.get("year"),
+                    "year": int(params.arguments.get("year")),
                     "day": params.arguments.get("day"),
                     "problem": params.arguments.get("problem"),
                     "summary": params.arguments.get("summary"),
                 },
             ) as response:
                 if response.status == 200:
-                    await params.result_callback({"status": "success", "message": "The appointment request has been sent"})
+                    response_text = await response.text()
+                    if "appointment" in response_text.lower():
+                        await params.result_callback({"status": "success", "message": "The appointment request has been sent successfully."})
+                    else:
+                        await params.result_callback({"status": "error", "message": f"Unexpected response from appointment service: {response_text}"})
                 else:
                     await params.result_callback({"status": "error", "message": f"Failed to send appointment request: {response.status}"})
     except Exception as e:
@@ -222,7 +218,7 @@ appointment_script_schema = FunctionSchema(
             "description": "Car model",
         },
         "year": {
-            "type": "string",
+            "type": "integer",
             "description": "Car year",
         },
         "day": {
