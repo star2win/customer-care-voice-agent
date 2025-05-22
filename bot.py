@@ -243,6 +243,40 @@ appointment_script_schema = FunctionSchema(
 
 tools = ToolsSchema(standard_tools=[appointment_script_schema, retrieve_business_info_schema])
 
+def load_prompts():
+    """Load prompts from the markdown file."""
+    try:
+        with open("prompts.md", "r") as f:
+            content = f.read()
+            
+        # Split the content into sections
+        sections = content.split("##")
+        
+        # Extract system prompt (first section after the title)
+        system_prompt = sections[1].split("\n", 1)[1].strip()
+        
+        # Extract initial greeting (second section)
+        initial_greeting = sections[2].split("\n", 1)[1].strip()
+        
+        return [
+            {
+                "role": "system",
+                "content": system_prompt
+            },
+            {
+                "role": "system",
+                "content": initial_greeting
+            }
+        ]
+    except Exception as e:
+        logger.error(f"Failed to load prompts: {e}")
+        # Fallback to default prompts if file reading fails
+        return [
+            {
+                "role": "system",
+                "content": "You are a friendly and efficient virtual assistant for Bavarian Motor Experts. How may I help you?"
+            }
+        ]
 
 async def main(args: SessionArguments):
     # Initialize RAG query engine once
@@ -288,59 +322,12 @@ async def main(args: SessionArguments):
 
     llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"), model="gpt-4o")
 
-    # Register the basketball scores functions
+    # Register the functions
     llm.register_function("appointment_script", appointment_script)
     llm.register_function("retrieve_business_info", retrieve_business_info)
 
-    messages = [
-        {
-            "role": "system",
-            "content": """You are a friendly and efficient virtual assistant for Bavarian Motor Experts.
-                You speak short sentences, are brief, and listen to the caller.
-                Your role is to assist customers by answering questions about the company's services, schedule appointments, and take messages.
-                You should use the provided knowledge base to offer accurate and helpful responses by using the 'retrieve_business_info' tool for any questions about the business itself (e.g. hours, services, location, policies).
-                The 'retrieve_business_info' tool will return a synthesized answer based on the knowledge base. You should use this answer to respond to the user.
-
-                <tasks>
-                - Answer Questions: If the question is about Bavarian Motor Experts (e.g., services, hours, location, specific policies), use the 'retrieve_business_info' tool with the user's query to get information. The tool will provide an answer; use this answer to respond to the user. If the tool indicates no information was found, politely state that you don't have that specific detail.
-                - Clarify Unclear Requests: Politely ask for more details if the customer's question is not clear, before attempting to use any tool.
-                - Make appointments for car service with 'appointment_script' tool.  Follow <appointment> script.
-                </tasks>
-
-                <guidelines>
-                - Maintain a friendly and professional tone throughout the conversation.
-                - Be patient and attentive to the customer's needs.
-                - If the 'retrieve_business_info' tool returns no information, politely state that you don't have that specific detail.
-                - Avoid discussing topics unrelated to the company's products or services.
-                - Aim to provide concise answers. Limit responses to a couple of sentences and let the user guide you on where to provide more detail.
-                - Do not repeat what the customer said.
-                - Do not repeat yourself.
-                - Do not confirm more than once.
-                - Pronounce each number individually.  For example 8870 would be pronounced eight, eight, seven, zero and not eighty eight seventy.
-                - When taking action like to run script, inform caller you are contacting the office for a follow-up while you send message.  The goal is not to have a long pause and have the caller wonder what is happening.
-                - IMPORTANT: Only call the appointment_script tool ONCE after ALL required information has been collected.
-                - When using 'retrieve_business_info', formulate a natural language query for the tool based on the user's question.
-                </guidelines>
-
-                <appointment>
-                Ask for the details below, one at a time, when scheduling an appointment, and inform that BME will call back next business day to confirm exact day and time for the appointment.
-                IMPORTANT: Only call the appointment_script tool ONCE after ALL of these details have been collected:
-                - First and Last name
-                - Ask if a phone call to {{system__caller_id}} works.  If {{system__caller_id}} is 0 ask the preferred phone number
-                - Car make, model, year
-                - Preferred day to service car
-                - Car problem description
-                
-                After collecting ALL information, call the appointment_script tool ONCE with all the details.
-                Wait for its response, informing the caller that you have reached out and are waiting for a response.
-                Once you get confirmation from appointment_script that the scheduling message was sent, let the user know it's done and hang up with 'end_call' tool.
-                </appointment>""",
-        },
-        {
-            "role": "system",
-            "content": "Start the conversation with:  Hi, I'm the Bavarian Motor Experts virtual agent.  How may I help you?",
-        },
-    ]
+    # Load prompts from markdown file
+    messages = load_prompts()
 
     context = OpenAILLMContext(messages, tools)
     context_aggregator = llm.create_context_aggregator(context)
