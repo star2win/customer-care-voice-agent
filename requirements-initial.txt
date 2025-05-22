@@ -1,0 +1,6 @@
+pipecatcloud
+pipecat-ai[cartesia,openai,silero,deepgram,daily]~=0.0.59
+fastapi
+uvicorn
+python-dotenv
+aiohttp
