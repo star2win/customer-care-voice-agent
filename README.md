@@ -1,7 +1,7 @@
-# Customer Care Voice Agent for Automotive Business
+# Customer Service Voice Agent for Automotive Business
 
 ## Overview
-A telephony based customer care agent built with Pipecat and LlamaIndex, utilizing a STT->LLM->TTS pipeline.  Make a call, learn about the business, and schedule an appointment.
+A telephony based customer service agent built with Pipecat and LlamaIndex, utilizing a STT->LLM->TTS pipeline.  Make a call, learn about the business, and schedule an appointment.
 
 Features include:
 * A prompt file "prompts.md" that contains the system prompt and initial greeting.
@@ -76,17 +76,17 @@ Set up a virtual environment before following these instructions. From the root 
 5. Host the bot with Docker on Daily  (Twilio optional):
 
    ```shell
-   docker build --platform=linux/arm64 -t customer-care-voice-agent:latest .
-   docker tag customer-care-voice-agent:latest your-username/customer-care-voice-agent:latest
-   docker push your-username/customer-care-voice-agent:latest
+   docker build --platform=linux/arm64 -t customer-service-voice-agent:latest .
+   docker tag customer-service-voice-agent:latest your-username/customer-service-voice-agent:latest
+   docker push your-username/customer-service-voice-agent:latest
    ```
 
    Deploy the bot to Daily:
 
    ```shell
    pcc auth login # to authenticate
-   pcc secrets set customer-care-voice-agent-secrets --file .env # to store your environment variables
-   pcc deploy customer-care-voice-agent your-username/customer-care-voice-agent:latest --secrets customer-care-voice-agent-secrets
+   pcc secrets set customer-service-voice-agent-secrets --file .env # to store your environment variables
+   pcc deploy customer-service-voice-agent your-username/customer-service-voice-agent:latest --secrets customer-service-voice-agent-secrets
    ```
 
    Create a TwiML Bin on Twilio with the following values from Daily Cloud:
@@ -96,7 +96,7 @@ Set up a virtual environment before following these instructions. From the root 
    <Response>
     <Connect>
         <Stream url="wss://api.pipecat.daily.co/ws/twilio">
-        <Parameter name="_pipecatCloudServiceHost" value="customer-care-voice-agent.ORGANIZATION_NAME"/>
+        <Parameter name="_pipecatCloudServiceHost" value="customer-service-voice-agent.ORGANIZATION_NAME"/>
         </Stream>
     </Connect>
    </Response>
