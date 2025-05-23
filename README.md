@@ -20,7 +20,7 @@ Features include:
 * LlamaIndex
 * Deepgram
 * OpenAI
-* ElevenLabs (or Cartesia, need to uncomment))
+* ElevenLabs (or Cartesia, need to uncomment)
 
 ## Optional
 * Docker
