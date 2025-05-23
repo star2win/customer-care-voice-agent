@@ -14,10 +14,12 @@ from loguru import logger
 
 # Pipecat imports
 from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.frames.frames import EndFrame, LLMMessagesFrame, TTSSpeakFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
+from pipecat.processors.user_idle_processor import UserIdleProcessor
 from pipecat.serializers.twilio import TwilioFrameSerializer
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.services.deepgram.stt import DeepgramSTTService
@@ -131,10 +133,66 @@ async def main(args: SessionArguments):
     context = OpenAILLMContext(messages, tools)
     context_aggregator = llm.create_context_aggregator(context)
 
+    # Store task reference for idle handler to access
+    task_ref = [None]
+    
+    # Define a simple handler for idle user detection
+    async def handle_user_idle(user_idle_processor: UserIdleProcessor, retry_count: int) -> bool:
+        if retry_count == 1:
+            # First attempt: Ask if they're still there
+            updated_messages = list(messages)
+            updated_messages.append(
+                {
+                    "role": "system",
+                    "content": "The user has been quiet. Politely and briefly ask if they're still there.",
+                }
+            )
+            await user_idle_processor.push_frame(LLMMessagesFrame(updated_messages))
+            return True
+        elif retry_count == 2:
+            # Second attempt: More direct prompt
+            updated_messages = list(messages)
+            updated_messages.append(
+                {
+                    "role": "system",
+                    "content": "The user is still inactive. Ask if they'd like to continue our conversation.",
+                }
+            )
+            await user_idle_processor.push_frame(LLMMessagesFrame(updated_messages))
+            return True
+        else:
+            # Final attempt: End the call
+            logger.info("User idle timeout reached. Terminating call.")
+            # Send goodbye message
+            await user_idle_processor.push_frame(
+                TTSSpeakFrame("It seems like you're busy right now. I'll disconnect the call. Have a nice day!")
+            )
+            # Wait for TTS to complete before ending
+            await asyncio.sleep(5.0)
+            
+            # End the call by sending EndFrame directly to the task
+            if task_ref[0]:
+                logger.info("Sending EndFrame to terminate call")
+                await task_ref[0].queue_frame(EndFrame())
+                # Also cancel the task to ensure termination
+                try:
+                    logger.info("Cancelling task to ensure termination")
+                    await task_ref[0].cancel()
+                except Exception as e:
+                    logger.error(f"Error cancelling task during idle termination: {e}")
+            else:
+                logger.error("Cannot terminate call: task reference not available")
+                
+            return False
+
+    # Create the idle user processor with 5 second timeout
+    user_idle = UserIdleProcessor(callback=handle_user_idle, timeout=5.0)
+
     pipeline = Pipeline(
         [
             transport.input(),
             stt,
+            user_idle,
             context_aggregator.user(),
             llm,
             tts,
@@ -152,28 +210,35 @@ async def main(args: SessionArguments):
             report_only_initial_ttfb=True,
         ),
     )
+    
+    # Set the task reference for the idle handler to use
+    task_ref[0] = task
 
     if isinstance(args, WebSocketSessionArguments):
         @transport.event_handler("on_client_connected")
         async def on_client_connected(transport, client):
             logger.info(f"Client connected: {client}")
-            # Kick off the conversation
             await task.queue_frames([context_aggregator.user().get_context_frame()])
 
         @transport.event_handler("on_client_disconnected")
         async def on_client_disconnected(transport, client):
             logger.info(f"Client disconnected: {client}")
-            await task.cancel()
+            try:
+                await task.cancel()
+            except Exception as e:
+                logger.error(f"Error during task cancellation: {str(e)}")
 
         @transport.event_handler("on_client_closed")
         async def on_client_closed(transport, client):
             logger.info(f"Client closed connection")
-            await task.cancel()
+            try:
+                await task.cancel()
+            except Exception as e:
+                logger.error(f"Error during task cancellation: {str(e)}")
     elif isinstance(args, DailySessionArguments):
         @transport.event_handler("on_first_participant_joined")
         async def on_first_participant_joined(transport, participant):
             await transport.capture_participant_transcription(participant["id"])
-            # Kick off the conversation
             await task.queue_frames([context_aggregator.user().get_context_frame()])
 
         @transport.event_handler("on_participant_left")
@@ -189,13 +254,21 @@ async def main(args: SessionArguments):
                 logger.debug("Ignoring Mediasoup consumer cleanup error")
 
     runner = PipelineRunner(handle_sigint=False)
-    await runner.run(task)
+    try:
+        await runner.run(task)
+    except asyncio.CancelledError:
+        logger.info("Pipeline task was cancelled. This is expected during normal call termination.")
+    except Exception as e:
+        logger.error(f"Pipeline task failed with an exception: {e}", exc_info=True)
+        raise
 
 
 async def bot(args: SessionArguments):
     try:
         await main(args)
-        logger.info("Bot process completed")
+        logger.info("Bot process completed successfully.")
+    except asyncio.CancelledError:
+        logger.info("Bot process was cancelled. This is expected during normal call termination.")
     except Exception as e:
         logger.exception(f"Error in bot process: {str(e)}")
         raise
@@ -232,4 +305,7 @@ async def local():
 
 
 if __name__ == "__main__":
+    # To enable more detailed asyncio debug logs for issues like 'tasks cancelled error':
+    # asyncio.run(local(), debug=True)
+    # For normal operation:
     asyncio.run(local())
