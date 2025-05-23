@@ -7,6 +7,8 @@
 import asyncio
 import json
 import os
+import sys
+import argparse
 
 import aiohttp
 from dotenv import load_dotenv
@@ -23,7 +25,8 @@ from pipecat.processors.user_idle_processor import UserIdleProcessor
 from pipecat.serializers.twilio import TwilioFrameSerializer
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.services.deepgram.stt import DeepgramSTTService
-from pipecat.services.cartesia.tts import CartesiaTTSService
+# from pipecat.services.cartesia.tts import CartesiaTTSService
+from pipecat.services.elevenlabs.tts import ElevenLabsTTSService, ElevenLabsHttpTTSService
 from pipecat.transports.network.fastapi_websocket import (
     FastAPIWebsocketParams,
     FastAPIWebsocketTransport,
@@ -79,17 +82,25 @@ def load_prompts():
             }
         ]
 
-async def main(args: SessionArguments):
+async def main(args: SessionArguments, twilio_stream_sid=None, twilio_call_sid=None):
     # Initialize RAG query engine once
     initialize_rag_query_engine()
 
     if isinstance(args, WebSocketSessionArguments):
         logger.debug("Starting WebSocket bot")
-
-        start_data = args.websocket.iter_text()
-        await start_data.__anext__()
-        call_data = json.loads(await start_data.__anext__())
-        stream_sid = call_data["start"]["streamSid"]
+        
+        # Check if this is a Twilio WebSocket (from run_bot function)
+        if twilio_stream_sid and twilio_call_sid:
+            logger.debug(f"Using provided Twilio stream_sid: {twilio_stream_sid} and call_sid: {twilio_call_sid}")
+            stream_sid = twilio_stream_sid
+        else:
+            # This is the standard WebSocket flow (not from Twilio server)
+            logger.debug("Standard WebSocket flow - reading stream data")
+            start_data = args.websocket.iter_text()
+            await start_data.__anext__()
+            call_data = json.loads(await start_data.__anext__())
+            stream_sid = call_data["start"]["streamSid"]
+            
         transport = FastAPIWebsocketTransport(
             websocket=args.websocket,
             params=FastAPIWebsocketParams(
@@ -116,9 +127,18 @@ async def main(args: SessionArguments):
 
     stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
 
-    tts = CartesiaTTSService(
-        api_key=os.getenv("CARTESIA_API_KEY"),
-        voice_id="71a7ad14-091c-4e8e-a314-022ece01c121",  # British Reading Lady
+    # tts = CartesiaTTSService(
+    #     api_key=os.getenv("CARTESIA_API_KEY"),
+    #     voice_id="71a7ad14-091c-4e8e-a314-022ece01c121",  # British Reading Lady
+    # )
+
+    # Create a client session that we'll properly manage and close
+    client_session = aiohttp.ClientSession()
+    
+    tts = ElevenLabsHttpTTSService(
+        api_key=os.getenv("ELEVENLABS_API_KEY"),
+        voice_id=os.getenv("ELEVENLABS_VOICE_ID"),
+        aiohttp_session=client_session,
     )
 
     llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"), model="gpt-4o")
@@ -214,44 +234,70 @@ async def main(args: SessionArguments):
     # Set the task reference for the idle handler to use
     task_ref[0] = task
 
+    # Register event handlers for the transport based on the type
+    # Handle different transport types with appropriate event handlers
     if isinstance(args, WebSocketSessionArguments):
         @transport.event_handler("on_client_connected")
         async def on_client_connected(transport, client):
             logger.info(f"Client connected: {client}")
             await task.queue_frames([context_aggregator.user().get_context_frame()])
 
-        @transport.event_handler("on_client_disconnected")
-        async def on_client_disconnected(transport, client):
-            logger.info(f"Client disconnected: {client}")
+        # Register event handlers for WebSocket transport
+        # Check if the transport supports each event handler before registering
+        try:
+            @transport.event_handler("on_client_disconnected")
+            async def on_client_disconnected(transport, client):
+                logger.info(f"Client disconnected: {client}")
+                try:
+                    await task.cancel()
+                except Exception as e:
+                    logger.error(f"Error during task cancellation: {str(e)}")
+        except Exception as e:
+            logger.debug(f"Transport does not support on_client_disconnected event: {str(e)}")
+            
+        # Only try to register on_client_closed if we're not using Twilio
+        # (FastAPIWebsocketTransport from Twilio doesn't support this event)
+        if not twilio_stream_sid:
             try:
-                await task.cancel()
+                @transport.event_handler("on_client_closed")
+                async def on_client_closed(transport, client):
+                    logger.info(f"Client closed connection")
+                    try:
+                        await task.cancel()
+                    except Exception as e:
+                        logger.error(f"Error during task cancellation: {str(e)}")
             except Exception as e:
-                logger.error(f"Error during task cancellation: {str(e)}")
-
-        @transport.event_handler("on_client_closed")
-        async def on_client_closed(transport, client):
-            logger.info(f"Client closed connection")
-            try:
-                await task.cancel()
-            except Exception as e:
-                logger.error(f"Error during task cancellation: {str(e)}")
+                logger.debug(f"Transport does not support on_client_closed event: {str(e)}")
     elif isinstance(args, DailySessionArguments):
-        @transport.event_handler("on_first_participant_joined")
-        async def on_first_participant_joined(transport, participant):
-            await transport.capture_participant_transcription(participant["id"])
-            await task.queue_frames([context_aggregator.user().get_context_frame()])
+        # Register event handlers for Daily transport
+        try:
+            @transport.event_handler("on_first_participant_joined")
+            async def on_first_participant_joined(transport, participant):
+                await transport.capture_participant_transcription(participant["id"])
+                await task.queue_frames([context_aggregator.user().get_context_frame()])
+        except Exception as e:
+            logger.debug(f"Transport does not support on_first_participant_joined event: {str(e)}")
 
-        @transport.event_handler("on_participant_left")
-        async def on_participant_left(transport, participant, reason):
-            logger.info(f"Participant left: {participant}")
-            try:
-                await task.cancel()
-            except Exception as e:
-                # Ignore Mediasoup consumer errors during cleanup
-                if "ConsumerNoLongerExists" not in str(e):
-                    logger.error(f"Error during cleanup: {str(e)}")
-                    raise
-                logger.debug("Ignoring Mediasoup consumer cleanup error")
+        try:
+            @transport.event_handler("on_participant_left")
+            async def on_participant_left(transport, participant, reason):
+                logger.info(f"Participant left: {participant}")
+                try:
+                    # Cancel the task first
+                    await task.cancel()
+                    
+                    # Ensure client session is properly closed
+                    if 'client_session' in locals() and not client_session.closed:
+                        logger.info("Closing aiohttp client session on participant left")
+                        await client_session.close()
+                except Exception as e:
+                    # Ignore Mediasoup consumer errors during cleanup
+                    if "ConsumerNoLongerExists" not in str(e):
+                        logger.error(f"Error during cleanup: {str(e)}")
+                        raise
+                    logger.debug("Ignoring Mediasoup consumer cleanup error")
+        except Exception as e:
+            logger.debug(f"Transport does not support on_participant_left event: {str(e)}")
 
     runner = PipelineRunner(handle_sigint=False)
     try:
@@ -261,6 +307,11 @@ async def main(args: SessionArguments):
     except Exception as e:
         logger.error(f"Pipeline task failed with an exception: {e}", exc_info=True)
         raise
+    finally:
+        # Ensure client session is properly closed
+        if 'client_session' in locals() and not client_session.closed:
+            logger.info("Closing aiohttp client session")
+            await client_session.close()
 
 
 async def bot(args: SessionArguments):
@@ -274,10 +325,37 @@ async def bot(args: SessionArguments):
         raise
 
 
+async def run_bot(websocket, stream_sid, call_sid, testing=False):
+    """Run the bot with a Twilio WebSocket connection.
+    
+    This function is called by the Twilio server script when running locally.
+    """
+    try:
+        from pipecatcloud.agent import WebSocketSessionArguments
+        
+        # Create WebSocketSessionArguments with the provided websocket
+        # Note: WebSocketSessionArguments only accepts session_id and websocket parameters
+        args = WebSocketSessionArguments(
+            session_id=call_sid,
+            websocket=websocket
+        )
+        
+        # Run the main bot function with the websocket arguments
+        # Pass the stream_sid and call_sid explicitly since they're already extracted in server.py
+        await main(args, twilio_stream_sid=stream_sid, twilio_call_sid=call_sid)
+        logger.info("Twilio bot process completed successfully.")
+    except asyncio.CancelledError:
+        logger.info("Twilio bot process was cancelled. This is expected during normal call termination.")
+    except Exception as e:
+        logger.exception(f"Error in Twilio bot process: {str(e)}")
+        raise
+
+
 async def local():
-    async with aiohttp.ClientSession() as session:
+    # Use a dedicated session for the configuration step
+    async with aiohttp.ClientSession() as config_session:
         if os.getenv("DAILY_API_KEY"):
-            (room_url, token) = await configure(session)
+            (room_url, token) = await configure(config_session)
 
             await main(
                 DailySessionArguments(
@@ -305,7 +383,27 @@ async def local():
 
 
 if __name__ == "__main__":
-    # To enable more detailed asyncio debug logs for issues like 'tasks cancelled error':
-    # asyncio.run(local(), debug=True)
-    # For normal operation:
-    asyncio.run(local())
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description="Customer Care Voice Agent")
+    parser.add_argument("mode", nargs="?", default="daily", help="Run mode: 'daily' (default) or 'local' for Twilio local server")
+    args = parser.parse_args()
+    
+    if args.mode == "local":
+        # If 'local' is specified, import and run the Twilio server
+        logger.info("Starting in Twilio local server mode")
+        # Import the server module and run it
+        try:
+            import server
+            # This will run the uvicorn server defined in server.py
+            import uvicorn
+            uvicorn.run(server.app, host="0.0.0.0", port=8765)
+        except ImportError:
+            logger.error("Failed to import server module. Make sure server.py exists in the current directory.")
+            sys.exit(1)
+    else:
+        # Default mode: run with Daily
+        logger.info("Starting in Daily mode")
+        # To enable more detailed asyncio debug logs for issues like 'tasks cancelled error':
+        # asyncio.run(local(), debug=True)
+        # For normal operation:
+        asyncio.run(local())
