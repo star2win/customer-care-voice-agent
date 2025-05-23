@@ -54,7 +54,7 @@ Set up a virtual environment before following these instructions. From the root 
 
    Configure Twilio with ngrok URL as the webhook.
 
-   Edit the streams.xml file to point to the ngrok URL.
+   Copy the streams-example.xml file to streams.xml in the templates directory and edit the file to point to the ngrok URL.
 
    ```xml
    <?xml version="1.0" encoding="UTF-8"?>

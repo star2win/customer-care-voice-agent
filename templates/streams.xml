@@ -1,6 +1,0 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Connect>
-        <Stream url="wss://c8ff-76-226-162-78.ngrok-free.app/ws" />
-    </Connect>
-</Response>
